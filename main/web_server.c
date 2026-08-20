@@ -32,6 +32,7 @@
 static httpd_handle_t s_httpd;
 static esp_netif_t *s_ap_netif;
 static bool s_wifi_started;
+static volatile bool s_ap_radio_started;
 static bool s_netif_created;
 static volatile bool s_start_requested;
 static volatile bool s_start_explicit;
@@ -84,7 +85,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
 {
     (void)arg;
     (void)base;
-    if (id == WIFI_EVENT_AP_STACONNECTED) {
+    if (id == WIFI_EVENT_AP_START) {
+        s_ap_radio_started = true;
+        ESP_LOGI("WEB", "SoftAP radio started");
+    } else if (id == WIFI_EVENT_AP_STOP) {
+        s_ap_radio_started = false;
+        s_sta_count = 0;
+        dongle_state_set_webui(false, 0);
+        ESP_LOGW("WEB", "SoftAP radio stopped");
+    } else if (id == WIFI_EVENT_AP_STACONNECTED) {
         const wifi_event_ap_staconnected_t *ev = data;
         s_sta_count++;
         memcpy(s_last_sta_mac, ev->mac, sizeof(s_last_sta_mac));
@@ -101,7 +110,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             ble_central_set_scan_paused(false);
             s_ble_scan_resume_requested = true;
         }
-        esp_wifi_deauth_sta(ev->aid);
         ESP_LOGW("WEB", "AP station disconnected " MACSTR " aid=%d reason=%d",
                  MAC2STR(ev->mac), ev->aid, ev->reason);
     }
@@ -544,6 +552,14 @@ static esp_err_t not_found_handler(httpd_req_t *req, httpd_err_code_t err)
     return httpd_resp_send(req, NULL, 0);
 }
 
+static esp_err_t captive_redirect_handler(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, NULL, 0);
+}
+
 static void register_uri(const char *uri, httpd_method_t method, esp_err_t (*handler)(httpd_req_t *))
 {
     httpd_uri_t h = { .uri = uri, .method = method, .handler = handler, .user_ctx = NULL };
@@ -675,13 +691,15 @@ void web_server_start(bool explicit_request)
         s_netif_created = true;
     }
     if (!s_wifi_started) {
+        bool controller_link_active = ble_central_has_active_links();
         static bool wifi_ever_inited;
         if (!wifi_ever_inited) {
             wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
             ESP_ERROR_CHECK(esp_wifi_init(&cfg));
             wifi_ever_inited = true;
         }
-        esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+        esp_coex_preference_set(controller_link_active ? ESP_COEX_PREFER_BT
+                                                       : ESP_COEX_PREFER_WIFI);
         if (!s_wifi_event_registered) {
             ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                                        wifi_event_handler, NULL));
@@ -712,7 +730,8 @@ void web_server_start(bool explicit_request)
          */
         ble_central_set_scan_paused(true);
         vTaskDelay(pdMS_TO_TICKS(200));
-        esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+        esp_coex_preference_set(controller_link_active ? ESP_COEX_PREFER_BT
+                                                       : ESP_COEX_PREFER_WIFI);
         /*
          * Use ESP-IDF's default AP protocol set. Forcing 11b/g made some
          * clients associate but never complete DHCP.
@@ -722,6 +741,10 @@ void web_server_start(bool explicit_request)
         ESP_ERROR_CHECK(esp_wifi_start());
         vTaskDelay(pdMS_TO_TICKS(50));
         ensure_ap_dhcp_running();
+        /* Controller traffic owns RF priority during play. Wi-Fi remains
+         * available, but the setup UI is deliberately secondary. */
+        esp_coex_preference_set(ble_central_has_active_links() ? ESP_COEX_PREFER_BT
+                                                               : ESP_COEX_PREFER_BALANCE);
         esp_wifi_set_inactive_time(WIFI_IF_AP, 300);
         esp_err_t txp_err = esp_wifi_set_max_tx_power(78);
         if (txp_err != ESP_OK) {
@@ -737,7 +760,9 @@ void web_server_start(bool explicit_request)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn = httpd_uri_match_wildcard;
     cfg.stack_size = 6144;
-    cfg.max_uri_handlers = 18;
+    cfg.max_uri_handlers = 24;
+    cfg.max_open_sockets = 8;
+    cfg.lru_purge_enable = true;
     ESP_ERROR_CHECK(httpd_start(&s_httpd, &cfg));
     register_uri("/", HTTP_GET, index_handler);
     register_uri("/api/status", HTTP_GET, status_handler);
@@ -754,6 +779,11 @@ void web_server_start(bool explicit_request)
     register_uri("/api/webui/disable", HTTP_POST, disable_handler);
     register_uri("/api/reboot", HTTP_POST, reboot_handler);
     register_uri("/api/update", HTTP_POST, update_handler);
+    register_uri("/generate_204", HTTP_GET, captive_redirect_handler);
+    register_uri("/gen_204", HTTP_GET, captive_redirect_handler);
+    register_uri("/hotspot-detect.html", HTTP_GET, captive_redirect_handler);
+    register_uri("/ncsi.txt", HTTP_GET, captive_redirect_handler);
+    register_uri("/connecttest.txt", HTTP_GET, captive_redirect_handler);
     httpd_register_err_handler(s_httpd, HTTPD_404_NOT_FOUND, not_found_handler);
     captive_portal_start();
 
@@ -785,7 +815,8 @@ void web_server_stop(void)
     if (s_wifi_started) {
         if (s_ap_netif) esp_netif_dhcps_stop(s_ap_netif);
         esp_wifi_stop();
-        esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
+        esp_coex_preference_set(ble_central_has_active_links() ? ESP_COEX_PREFER_BT
+                                                               : ESP_COEX_PREFER_BALANCE);
         s_wifi_started = false;
     }
     dongle_state_set_webui(false, 0);
@@ -798,12 +829,14 @@ void web_server_notify_usb_suspend(bool suspended)
 
 bool web_server_is_active(void)
 {
-    return s_httpd != NULL;
+    return s_httpd != NULL && s_wifi_started && s_ap_radio_started;
 }
 
 bool web_server_is_active_or_requested(void)
 {
-    return s_httpd != NULL || s_start_requested;
+    /* Treat a starting or temporarily unhealthy AP as active for coexistence
+     * purposes so BLE never falls back to continuous scanning beside it. */
+    return s_httpd != NULL || s_wifi_started || s_start_requested;
 }
 
 bool web_server_has_clients(void)

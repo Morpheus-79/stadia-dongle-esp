@@ -15,6 +15,10 @@ void ble_central_start_scan(void);
 // Existing BLE controller connections and notifications are not affected.
 void ble_central_set_scan_paused(bool paused);
 
+// True while at least one controller is connecting, discovering, or ready.
+// Used to keep RF coexistence biased toward controller traffic.
+bool ble_central_has_active_links(void);
+
 // Schedule a GATT Write-With-Response of `payload` (4 bytes) to the Stadia
 // rumble output characteristic.  Safe to call from any FreeRTOS task — the
 // write is executed via a NimBLE callout on the NimBLE event queue.

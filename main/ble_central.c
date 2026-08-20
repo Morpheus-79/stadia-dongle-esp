@@ -15,6 +15,7 @@
 #include "web_server.h"
 
 #include "esp_log.h"
+#include "esp_coexist.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -40,6 +41,24 @@ static bool s_nimble_synced;
 #define BLE_RESTART_SCAN_US 1000000
 #define BLE_BOOT_SCAN_DELAY_US 2000000
 #define BLE_BATTERY_POLL_US 60000000
+#define BLE_SETUP_BACKOFF_MAX_US 8000000
+#define BLE_SETUP_RETRY_RECORDS (DONGLE_MAX_CONTROLLERS * 2)
+
+/*
+ * The ESP32-S3 has one RF path shared by Wi-Fi and BLE. A 16/16 BLE scan
+ * listens continuously and can make a SoftAP difficult to discover or join.
+ * Keep discovery sparse while the Web UI AP is running. Once a controller is
+ * active, discovery of additional named Stadia devices stays active but drops
+ * to a 3.125% duty cycle so controller connection events retain RF headroom.
+ * NimBLE scan interval/window units are 0.625 ms.
+ */
+#define BLE_SCAN_FAST_INTERVAL 16
+#define BLE_SCAN_FAST_WINDOW 16
+#define BLE_SCAN_WEB_PASSIVE_INTERVAL 800
+#define BLE_SCAN_WEB_ACTIVE_INTERVAL 160
+#define BLE_SCAN_WEB_WINDOW 16
+#define BLE_SCAN_CONNECTED_INTERVAL 256
+#define BLE_SCAN_CONNECTED_WINDOW 8
 
 typedef enum {
     CONTROLLER_SLOT_EMPTY,
@@ -87,13 +106,31 @@ typedef struct {
     uint8_t usb_gamepad_index;
     bool last_report_valid;
     uint8_t last_xbox_report[DONGLE_XBOX_REPORT_SIZE];
+    int64_t connected_at_us;
+    int64_t ready_at_us;
+    int64_t last_input_us;
+    uint32_t input_report_count;
 
     controller_slot_state_t state;
     struct ble_npl_callout rumble_callout;
     uint8_t rumble_payload[DONGLE_RUMBLE_REPORT_SIZE];
+    int64_t last_rumble_start_us;
+    int64_t last_rumble_complete_us;
+    uint32_t rumble_write_count;
+    int last_rumble_status;
+    bool rumble_completion_seen;
 } controller_slot_t;
 
+typedef struct {
+    bool used;
+    ble_addr_t peer_addr;
+    uint8_t failures;
+    int64_t retry_after_us;
+    bool skip_logged;
+} setup_retry_record_t;
+
 static controller_slot_t s_slots[DONGLE_MAX_CONTROLLERS];
+static setup_retry_record_t s_setup_retries[BLE_SETUP_RETRY_RECORDS];
 static SemaphoreHandle_t s_slot_lock;
 static SemaphoreHandle_t s_scan_lock;
 static esp_timer_handle_t s_reconnect_timer;
@@ -104,6 +141,8 @@ static bool s_scan_paused;
 static void start_scan(void);
 static int gap_event_fn(struct ble_gap_event *event, void *arg);
 static void process_next_chr(controller_slot_t *slot);
+static void start_hid_discovery(controller_slot_t *slot);
+static void enable_input_notifications(controller_slot_t *slot);
 static void rumble_callout_fn(struct ble_npl_event *ev);
 static int battery_read_cb(uint16_t conn_handle, const struct ble_gatt_error *err,
                            struct ble_gatt_attr *attr, void *arg);
@@ -126,6 +165,93 @@ static void init_slot_callout(controller_slot_t *slot)
 static bool addr_equal(const ble_addr_t *a, const ble_addr_t *b)
 {
     return a && b && a->type == b->type && memcmp(a->val, b->val, sizeof(a->val)) == 0;
+}
+
+static const char *ble_status_name(int status)
+{
+    if (status == 0) return "ok";
+    if (status == BLE_HS_ENOTCONN) return "not-connected";
+    if (status == BLE_HS_ETIMEOUT) return "host-timeout";
+    if (status == BLE_HS_HCI_ERR(BLE_ERR_CONN_SPVN_TMO)) return "connection-supervision-timeout";
+    if (status == BLE_HS_HCI_ERR(BLE_ERR_PINKEY_MISSING)) return "pin-or-key-missing";
+    if (status == BLE_HS_HCI_ERR(BLE_ERR_AUTH_FAIL)) return "authentication-failure";
+    if (status == BLE_HS_HCI_ERR(BLE_ERR_REM_USER_CONN_TERM)) return "remote-user-terminated";
+    if (status == BLE_HS_HCI_ERR(BLE_ERR_CONN_TERM_LOCAL)) return "local-host-terminated";
+    return "other";
+}
+
+static const char *slot_state_name(controller_slot_state_t state)
+{
+    switch (state) {
+    case CONTROLLER_SLOT_EMPTY: return "empty";
+    case CONTROLLER_SLOT_CONNECTING: return "connecting";
+    case CONTROLLER_SLOT_DISCOVERING: return "discovering";
+    case CONTROLLER_SLOT_ENCRYPTING: return "encrypting";
+    case CONTROLLER_SLOT_READY: return "ready";
+    case CONTROLLER_SLOT_DISCONNECTING: return "disconnecting";
+    default: return "unknown";
+    }
+}
+
+static setup_retry_record_t *setup_retry_find(const ble_addr_t *addr, bool create)
+{
+    setup_retry_record_t *free_record = NULL;
+    setup_retry_record_t *oldest = NULL;
+
+    for (size_t i = 0; i < BLE_SETUP_RETRY_RECORDS; i++) {
+        setup_retry_record_t *record = &s_setup_retries[i];
+        if (record->used && addr_equal(&record->peer_addr, addr)) return record;
+        if (!record->used && !free_record) free_record = record;
+        if (record->used && (!oldest || record->retry_after_us < oldest->retry_after_us)) {
+            oldest = record;
+        }
+    }
+    if (!create) return NULL;
+
+    setup_retry_record_t *record = free_record ? free_record : oldest;
+    if (!record) return NULL;
+    memset(record, 0, sizeof(*record));
+    record->used = true;
+    record->peer_addr = *addr;
+    return record;
+}
+
+static bool setup_retry_is_waiting(const ble_addr_t *addr)
+{
+    setup_retry_record_t *record = setup_retry_find(addr, false);
+    if (!record) return false;
+
+    int64_t remaining_us = record->retry_after_us - esp_timer_get_time();
+    if (remaining_us <= 0) {
+        record->skip_logged = false;
+        return false;
+    }
+    if (!record->skip_logged) {
+        char addr_str[DONGLE_ADDR_STR_LEN];
+        addr_to_str(addr, addr_str, sizeof(addr_str));
+        ESP_LOGW(TAG, "setup retry delayed addr=%s remaining=%lld ms failures=%u",
+                 addr_str, (long long)((remaining_us + 999) / 1000), record->failures);
+        record->skip_logged = true;
+    }
+    return true;
+}
+
+static void setup_retry_note_failure(const ble_addr_t *addr)
+{
+    setup_retry_record_t *record = setup_retry_find(addr, true);
+    if (!record) return;
+
+    if (record->failures < 4) record->failures++;
+    int64_t delay_us = BLE_RESTART_SCAN_US << (record->failures - 1);
+    if (delay_us > BLE_SETUP_BACKOFF_MAX_US) delay_us = BLE_SETUP_BACKOFF_MAX_US;
+    record->retry_after_us = esp_timer_get_time() + delay_us;
+    record->skip_logged = false;
+}
+
+static void setup_retry_clear(const ble_addr_t *addr)
+{
+    setup_retry_record_t *record = setup_retry_find(addr, false);
+    if (record) memset(record, 0, sizeof(*record));
 }
 
 static controller_slot_t *slot_by_conn(uint16_t conn_handle)
@@ -191,6 +317,7 @@ static controller_slot_t *alloc_slot(const ble_addr_t *addr)
             addr_to_str(addr, slot->addr_str, sizeof(slot->addr_str));
             snprintf(slot->name, sizeof(slot->name), "Stadia Controller");
             dongle_state_controller_set_info(i, i, slot->addr_str, slot->name, false);
+            esp_coex_preference_set(ESP_COEX_PREFER_BT);
             ESP_LOGI(TAG, "slot %u usb %u allocated addr=%s", i, i, slot->addr_str);
             if (s_slot_lock) xSemaphoreGive(s_slot_lock);
             return slot;
@@ -219,7 +346,15 @@ static void clear_slot(controller_slot_t *slot)
     mouse_mode_reset(usb);
     bridge_send_neutral(usb);
     if (s_slot_lock) xSemaphoreGive(s_slot_lock);
+    if (occupied_slots() == 0) {
+        esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
+    }
     ESP_LOGI(TAG, "slot %u usb %u cleared", idx, usb);
+}
+
+bool ble_central_has_active_links(void)
+{
+    return occupied_slots() > 0;
 }
 
 static void update_global_state_after_slot_change(void)
@@ -319,12 +454,26 @@ static void start_scan(void)
     s_force_active_scan = false;
     if (s_scan_lock) xSemaphoreGive(s_scan_lock);
 
+    int active_slots = occupied_slots();
+    bool controller_active = active_slots > 0;
     bool web_active = web_server_is_active_or_requested();
     bool pairing = controller_manager_is_pairing_mode();
+    /* Active background discovery preserves support for every device whose
+     * advertised name begins with "Stadia", including devices that put their
+     * name in a scan response. Its low duty cycle affects discovery speed,
+     * never the established controller connection interval. */
+    bool active_scan = controller_active || pairing || force_active;
     struct ble_gap_disc_params params = {
-        .itvl = web_active && !pairing && !force_active ? 800 : 16,
-        .window = web_active && !pairing && !force_active ? 16 : 16,
-        .passive = web_active && !pairing && !force_active,
+        .itvl = controller_active
+                    ? BLE_SCAN_CONNECTED_INTERVAL
+                    : (web_active
+                           ? (active_scan ? BLE_SCAN_WEB_ACTIVE_INTERVAL
+                                          : BLE_SCAN_WEB_PASSIVE_INTERVAL)
+                           : BLE_SCAN_FAST_INTERVAL),
+        .window = controller_active
+                      ? BLE_SCAN_CONNECTED_WINDOW
+                      : (web_active ? BLE_SCAN_WEB_WINDOW : BLE_SCAN_FAST_WINDOW),
+        .passive = !active_scan,
         .filter_duplicates = 0,
     };
     rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &params, gap_event_fn, NULL);
@@ -335,9 +484,10 @@ static void start_scan(void)
         return;
     }
     dongle_state_set(DONGLE_STATE_SCANNING);
-    ESP_LOGI(TAG, "Scanning capacity=%d/%u mode=%s itvl=%u window=%u",
-             occupied_slots(), (unsigned)DONGLE_MAX_CONTROLLERS,
-             params.passive ? "passive" : "active", params.itvl, params.window);
+    ESP_LOGI(TAG, "Scanning capacity=%d/%u mode=%s itvl=%u window=%u web=%d background=%d",
+             active_slots, (unsigned)DONGLE_MAX_CONTROLLERS,
+             params.passive ? "passive" : "active", params.itvl, params.window,
+             web_active, controller_active);
 }
 
 void ble_central_start_scan(void)
@@ -364,33 +514,57 @@ void ble_central_set_scan_paused(bool paused)
         ESP_LOGI(TAG, "BLE discovery paused for Wi-Fi AP client");
     } else {
         ESP_LOGI(TAG, "BLE discovery resumed after Wi-Fi AP client");
-        if (s_nimble_synced) ble_central_start_scan();
+        /* Resume using the existing scan intent. Calling the public start
+         * function here used to force a continuous active scan immediately
+         * after DHCP completed. */
+        if (s_nimble_synced) start_scan();
     }
 }
 
 static int cccd_write_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
                          struct ble_gatt_attr *attr, void *arg);
-
-static void subscribe(controller_slot_t *slot)
-{
-    if (!slot_valid(slot, slot->conn_handle)) return;
-    slot->state = CONTROLLER_SLOT_ENCRYPTING;
-    ESP_LOGI(TAG, "slot %u usb %u initiating security conn=%u in=0x%04x cccd=0x%04x out=0x%04x",
-             slot->slot_index, slot->usb_gamepad_index, slot->conn_handle,
-             slot->input_val_handle, slot->input_cccd_handle, slot->output_val_handle);
-    int rc = ble_gap_security_initiate(slot->conn_handle);
-    if (rc == 0) return;
-
-    if (rc != BLE_HS_EALREADY) {
-        ESP_LOGW(TAG, "slot %u security initiate failed: %d; trying CCCD anyway", slot->slot_index, rc);
-    }
-    uint8_t val[2] = {0x01, 0x00};
-    ble_gattc_write_flat(slot->conn_handle, slot->input_cccd_handle,
-                         val, sizeof(val), cccd_write_fn, slot);
-}
-
 static int svc_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
                        const struct ble_gatt_svc *svc, void *arg);
+
+static void start_hid_discovery(controller_slot_t *slot)
+{
+    if (!slot_valid(slot, slot->conn_handle)) return;
+    if (slot->state != CONTROLLER_SLOT_ENCRYPTING) return;
+
+    slot->hid_svc_start = 0;
+    slot->hid_svc_end = 0;
+    slot->input_val_handle = 0;
+    slot->output_val_handle = 0;
+    slot->input_cccd_handle = 0;
+    slot->chr_count = 0;
+    slot->cur_chr = 0;
+    slot->state = CONTROLLER_SLOT_DISCOVERING;
+
+    ble_uuid16_t hid_uuid = BLE_UUID16_INIT(0x1812);
+    int rc = ble_gattc_disc_svc_by_uuid(slot->conn_handle, &hid_uuid.u, svc_disc_fn, slot);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "slot %u HID discovery failed to start: %d (%s)",
+                 slot->slot_index, rc, ble_status_name(rc));
+        ble_gap_terminate(slot->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    }
+}
+
+static void enable_input_notifications(controller_slot_t *slot)
+{
+    if (!slot_valid(slot, slot->conn_handle)) return;
+    ESP_LOGI(TAG, "slot %u usb %u enabling input conn=%u in=0x%04x cccd=0x%04x out=0x%04x",
+             slot->slot_index, slot->usb_gamepad_index, slot->conn_handle,
+             slot->input_val_handle, slot->input_cccd_handle, slot->output_val_handle);
+    uint8_t val[2] = {0x01, 0x00};
+    int rc = ble_gattc_write_flat(slot->conn_handle, slot->input_cccd_handle,
+                                  val, sizeof(val), cccd_write_fn, slot);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "slot %u CCCD write failed to start: %d (%s)",
+                 slot->slot_index, rc, ble_status_name(rc));
+        ble_gap_terminate(slot->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    }
+}
+
 static int chr_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
                        const struct ble_gatt_chr *chr, void *arg);
 static int dsc_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
@@ -417,7 +591,11 @@ static int svc_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
         return 0;
     }
     if (err->status != 0) {
-        ESP_LOGE(TAG, "slot %u svc disc error: %d", slot->slot_index, err->status);
+        ESP_LOGE(TAG, "slot %u svc disc error: %d (%s)", slot->slot_index,
+                 err->status, ble_status_name(err->status));
+        if (err->status != BLE_HS_ENOTCONN) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
         return 0;
     }
     slot->hid_svc_start = svc->start_handle;
@@ -437,7 +615,11 @@ static int chr_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
         return 0;
     }
     if (err->status != 0) {
-        ESP_LOGE(TAG, "slot %u chr disc error: %d", slot->slot_index, err->status);
+        ESP_LOGE(TAG, "slot %u chr disc error: %d (%s)", slot->slot_index,
+                 err->status, ble_status_name(err->status));
+        if (err->status != BLE_HS_ENOTCONN) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
         return 0;
     }
     if (chr->uuid.u.type == BLE_UUID_TYPE_16 &&
@@ -461,7 +643,7 @@ static void process_next_chr(controller_slot_t *slot)
             ble_gap_terminate(slot->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
             return;
         }
-        subscribe(slot);
+        enable_input_notifications(slot);
         return;
     }
 
@@ -496,9 +678,11 @@ static int dsc_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
         return 0;
     }
     if (err->status != 0) {
-        ESP_LOGE(TAG, "slot %u dsc disc error: %d", slot->slot_index, err->status);
-        slot->cur_chr++;
-        process_next_chr(slot);
+        ESP_LOGE(TAG, "slot %u dsc disc error: %d (%s)", slot->slot_index,
+                 err->status, ble_status_name(err->status));
+        if (err->status != BLE_HS_ENOTCONN) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
         return 0;
     }
     if (dsc->uuid.u.type == BLE_UUID_TYPE_16) {
@@ -611,9 +795,10 @@ static int cccd_write_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
     if (!slot_valid(slot, conn_handle)) return 0;
     if (err->status == 0) {
         slot->state = CONTROLLER_SLOT_READY;
+        slot->ready_at_us = esp_timer_get_time();
+        setup_retry_clear(&slot->peer_addr);
         dongle_state_controller_set_connected(slot->slot_index, true, true);
         controller_manager_stop_pairing();
-        web_server_request_start(false);
         update_global_state_after_slot_change();
         ESP_LOGI(TAG, "slot %u usb %u ready conn=%u addr=%s",
                  slot->slot_index, slot->usb_gamepad_index, conn_handle, slot->addr_str);
@@ -625,8 +810,27 @@ static int cccd_write_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
             start_scan();
         }
     } else {
-        ESP_LOGE(TAG, "slot %u CCCD write failed: %d", slot->slot_index, err->status);
+        ESP_LOGE(TAG, "slot %u CCCD write failed: %d (%s)", slot->slot_index,
+                 err->status, ble_status_name(err->status));
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    }
+    return 0;
+}
+
+static int rumble_write_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
+                           struct ble_gatt_attr *attr, void *arg)
+{
+    (void)attr;
+    controller_slot_t *slot = arg;
+    if (!slot_valid(slot, conn_handle)) return 0;
+
+    slot->last_rumble_complete_us = esp_timer_get_time();
+    slot->last_rumble_status = err->status;
+    slot->rumble_completion_seen = true;
+    if (err->status != 0) {
+        ESP_LOGW(TAG, "slot %u usb %u rumble completion failed conn=%u status=%d (%s)",
+                 slot->slot_index, slot->usb_gamepad_index, conn_handle,
+                 err->status, ble_status_name(err->status));
     }
     return 0;
 }
@@ -636,11 +840,14 @@ static void rumble_callout_fn(struct ble_npl_event *ev)
     controller_slot_t *slot = ble_npl_event_get_arg(ev);
     if (!slot || !slot->used || slot->state != CONTROLLER_SLOT_READY || !slot->output_val_handle) return;
     int rc = ble_gattc_write_flat(slot->conn_handle, slot->output_val_handle,
-                                  slot->rumble_payload, DONGLE_RUMBLE_REPORT_SIZE, NULL, NULL);
+                                  slot->rumble_payload, DONGLE_RUMBLE_REPORT_SIZE,
+                                  rumble_write_fn, slot);
     if (rc != 0) {
         ESP_LOGW(TAG, "slot %u usb %u rumble write start failed conn=%u rc=%d",
                  slot->slot_index, slot->usb_gamepad_index, slot->conn_handle, rc);
     } else {
+        slot->last_rumble_start_us = esp_timer_get_time();
+        slot->rumble_write_count++;
         ESP_LOGI(TAG, "slot %u usb %u rumble routed", slot->slot_index, slot->usb_gamepad_index);
     }
 }
@@ -684,6 +891,7 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
         bool is_bonded = (!is_stadia && !is_directed) ? is_bonded_addr(&event->disc.addr) : false;
         if (!is_stadia && !is_directed && !is_bonded) break;
         if (!controller_manager_should_connect(&event->disc.addr, is_stadia, is_directed)) break;
+        if (setup_retry_is_waiting(&event->disc.addr)) break;
 
         controller_slot_t *slot = alloc_slot(&event->disc.addr);
         if (!slot) {
@@ -699,7 +907,8 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
             .itvl_min = DONGLE_MAX_CONTROLLERS > 1 ? 9 : 6,
             .itvl_max = DONGLE_MAX_CONTROLLERS > 1 ? 12 : 6,
             .latency = 0,
-            .supervision_timeout = 300,
+            /* Failure-detection margin only; report cadence remains 11.25-15 ms. */
+            .supervision_timeout = 800,
             .min_ce_len = 0,
             .max_ce_len = 0,
         };
@@ -708,7 +917,9 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
         int rc = ble_gap_connect(own_addr_type, &event->disc.addr, 5000,
                                  &conn_params, gap_event_fn, slot);
         if (rc != 0) {
-            ESP_LOGW(TAG, "slot %u connect start failed: %d", slot->slot_index, rc);
+            setup_retry_note_failure(&slot->peer_addr);
+            ESP_LOGW(TAG, "slot %u connect start failed: %d (%s)", slot->slot_index,
+                     rc, ble_status_name(rc));
             clear_slot(slot);
             if (s_scan_lock) xSemaphoreTake(s_scan_lock, portMAX_DELAY);
             s_force_active_scan = true;
@@ -726,9 +937,11 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
         if (!slot || !slot->used) break;
         if (event->connect.status == 0) {
             slot->conn_handle = event->connect.conn_handle;
-            slot->state = CONTROLLER_SLOT_DISCOVERING;
+            slot->state = CONTROLLER_SLOT_ENCRYPTING;
+            slot->connected_at_us = esp_timer_get_time();
             struct ble_gap_conn_desc desc;
-            if (ble_gap_conn_find(slot->conn_handle, &desc) == 0) {
+            bool have_desc = ble_gap_conn_find(slot->conn_handle, &desc) == 0;
+            if (have_desc) {
                 slot->peer_addr = desc.peer_id_addr;
                 addr_to_str(&slot->peer_addr, slot->addr_str, sizeof(slot->addr_str));
                 controller_manager_note_connected(&desc.peer_id_addr, slot->name);
@@ -736,13 +949,36 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
                                                  slot->addr_str, slot->name, is_bonded_addr(&slot->peer_addr));
             }
             dongle_state_controller_set_connected(slot->slot_index, true, false);
-            ESP_LOGI(TAG, "slot %u usb %u connected addr=%s conn=%u",
-                     slot->slot_index, slot->usb_gamepad_index, slot->addr_str, slot->conn_handle);
+            if (have_desc) {
+                ESP_LOGI(TAG,
+                         "slot %u usb %u connected addr=%s conn=%u interval=%u (%u us) latency=%u supervision=%u (%u ms) encrypted=%u authenticated=%u bonded=%u",
+                         slot->slot_index, slot->usb_gamepad_index, slot->addr_str,
+                         slot->conn_handle, desc.conn_itvl, desc.conn_itvl * 1250,
+                         desc.conn_latency, desc.supervision_timeout,
+                         desc.supervision_timeout * 10, desc.sec_state.encrypted,
+                         desc.sec_state.authenticated, desc.sec_state.bonded);
+            } else {
+                ESP_LOGI(TAG, "slot %u usb %u connected addr=%s conn=%u",
+                         slot->slot_index, slot->usb_gamepad_index, slot->addr_str,
+                         slot->conn_handle);
+            }
 
-            ble_uuid16_t hid_uuid = BLE_UUID16_INIT(0x1812);
-            ble_gattc_disc_svc_by_uuid(slot->conn_handle, &hid_uuid.u, svc_disc_fn, slot);
+            if (have_desc && desc.sec_state.encrypted) {
+                start_hid_discovery(slot);
+                break;
+            }
+
+            ESP_LOGI(TAG, "slot %u initiating security before HID discovery", slot->slot_index);
+            int rc = ble_gap_security_initiate(slot->conn_handle);
+            if (rc != 0 && rc != BLE_HS_EALREADY) {
+                ESP_LOGE(TAG, "slot %u security initiate failed: %d (%s)",
+                         slot->slot_index, rc, ble_status_name(rc));
+                ble_gap_terminate(slot->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            }
         } else {
-            ESP_LOGW(TAG, "slot %u connect failed: %d", slot->slot_index, event->connect.status);
+            setup_retry_note_failure(&slot->peer_addr);
+            ESP_LOGW(TAG, "slot %u connect failed: %d (%s)", slot->slot_index,
+                     event->connect.status, ble_status_name(event->connect.status));
             clear_slot(slot);
             if (s_scan_lock) xSemaphoreTake(s_scan_lock, portMAX_DELAY);
             s_force_active_scan = true;
@@ -755,18 +991,40 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISCONNECT: {
         controller_slot_t *slot = slot_by_conn(event->disconnect.conn.conn_handle);
         uint8_t usb = slot ? slot->usb_gamepad_index : 0;
-        ESP_LOGW(TAG, "slot %u usb %u disconnected reason=%d",
-                 slot ? slot->slot_index : 255, usb, event->disconnect.reason);
+        controller_slot_state_t previous_state = slot ? slot->state : CONTROLLER_SLOT_EMPTY;
+        int64_t now_us = esp_timer_get_time();
+        int64_t connected_ms = slot && slot->connected_at_us
+                                   ? (now_us - slot->connected_at_us) / 1000
+                                   : -1;
+        int64_t input_age_ms = slot && slot->last_input_us
+                                   ? (now_us - slot->last_input_us) / 1000
+                                   : -1;
+        int64_t rumble_start_age_ms = slot && slot->last_rumble_start_us
+                                          ? (now_us - slot->last_rumble_start_us) / 1000
+                                          : -1;
+        int64_t rumble_done_age_ms = slot && slot->last_rumble_complete_us
+                                         ? (now_us - slot->last_rumble_complete_us) / 1000
+                                         : -1;
+        ESP_LOGW(TAG,
+                 "slot %u usb %u disconnected reason=%d (%s) state=%s connected_ms=%lld last_input_age_ms=%lld reports=%lu last_rumble_start_age_ms=%lld last_rumble_done_age_ms=%lld rumble_writes=%lu rumble_status=%d",
+                 slot ? slot->slot_index : 255, usb, event->disconnect.reason,
+                 ble_status_name(event->disconnect.reason), slot_state_name(previous_state),
+                 (long long)connected_ms, (long long)input_age_ms,
+                 (unsigned long)(slot ? slot->input_report_count : 0),
+                 (long long)rumble_start_age_ms, (long long)rumble_done_age_ms,
+                 (unsigned long)(slot ? slot->rumble_write_count : 0),
+                 slot && slot->rumble_completion_seen ? slot->last_rumble_status : -1);
         if (slot) {
+            if (previous_state != CONTROLLER_SLOT_READY &&
+                previous_state != CONTROLLER_SLOT_DISCONNECTING) {
+                setup_retry_note_failure(&slot->peer_addr);
+            }
             slot->state = CONTROLLER_SLOT_DISCONNECTING;
             bridge_send_neutral(usb);
             clear_slot(slot);
         }
         controller_manager_note_disconnected();
         update_global_state_after_slot_change();
-        if (occupied_slots() == 0) {
-            web_server_request_start(false);
-        }
         if (s_scan_lock) xSemaphoreTake(s_scan_lock, portMAX_DELAY);
         s_force_active_scan = true;
         if (s_scan_lock) xSemaphoreGive(s_scan_lock);
@@ -784,6 +1042,8 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
             ESP_LOGW(TAG, "slot %u malformed input len=%u", slot->slot_index, len);
             break;
         }
+        slot->last_input_us = esp_timer_get_time();
+        slot->input_report_count++;
         uint8_t xbox[DONGLE_XBOX_REPORT_SIZE];
         stadia_controller_state_t state;
         stadia_parse_state(raw, len, &state);
@@ -823,13 +1083,20 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_ENC_CHANGE: {
         controller_slot_t *slot = slot_by_conn(event->enc_change.conn_handle);
-        ESP_LOGI(TAG, "slot %u encryption status=%d",
-                 slot ? slot->slot_index : 255, event->enc_change.status);
+        struct ble_gap_conn_desc desc;
+        bool have_desc = slot && ble_gap_conn_find(event->enc_change.conn_handle, &desc) == 0;
+        ESP_LOGI(TAG,
+                 "slot %u encryption status=%d (%s) encrypted=%u authenticated=%u bonded=%u state=%s",
+                 slot ? slot->slot_index : 255, event->enc_change.status,
+                 ble_status_name(event->enc_change.status),
+                 have_desc ? desc.sec_state.encrypted : 0,
+                 have_desc ? desc.sec_state.authenticated : 0,
+                 have_desc ? desc.sec_state.bonded : 0,
+                 slot ? slot_state_name(slot->state) : "missing");
         if (!slot) break;
-        if (event->enc_change.status == 0 && slot->input_cccd_handle) {
-            uint8_t val[2] = {0x01, 0x00};
-            ble_gattc_write_flat(slot->conn_handle, slot->input_cccd_handle,
-                                 val, sizeof(val), cccd_write_fn, slot);
+        if (event->enc_change.status == 0 &&
+            (!have_desc || desc.sec_state.encrypted)) {
+            start_hid_discovery(slot);
         } else if (event->enc_change.status != 0) {
             ble_gap_terminate(event->enc_change.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         }
