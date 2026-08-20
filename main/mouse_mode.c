@@ -12,8 +12,9 @@ static const char *TAG = "MOUSE";
 
 static bool s_mouse_mode[DONGLE_MAX_CONTROLLERS];
 
-static int32_t s_smooth_x[DONGLE_MAX_CONTROLLERS];
-static int32_t s_smooth_y[DONGLE_MAX_CONTROLLERS];
+static int32_t s_speed_q16[DONGLE_MAX_CONTROLLERS];
+static int32_t s_motion_x_q16[DONGLE_MAX_CONTROLLERS];
+static int32_t s_motion_y_q16[DONGLE_MAX_CONTROLLERS];
 static bool s_dpad_up_prev[DONGLE_MAX_CONTROLLERS];
 static bool s_dpad_down_prev[DONGLE_MAX_CONTROLLERS];
 static bool s_a_prev[DONGLE_MAX_CONTROLLERS];
@@ -25,16 +26,19 @@ static bool s_cached_valid[DONGLE_MAX_CONTROLLERS];
 
 #define MOUSE_STICK_DEADZONE 3277
 #define MOUSE_SCROLL_DEADZONE 6000
-#define MOUSE_SPEED_MAX 18
+#define MOUSE_SPEED_MAX 14
 #define MOUSE_PRECISION_DIV 3
 #define MOUSE_FAST_MUL 2
+#define MOUSE_Q16_ONE 65536
+#define MOUSE_MOTION_LIMIT_Q16 (127 * MOUSE_Q16_ONE)
 
 void mouse_mode_init(void)
 {
     for (uint8_t i = 0; i < DONGLE_MAX_CONTROLLERS; i++) {
         s_mouse_mode[i] = false;
-        s_smooth_x[i] = 0;
-        s_smooth_y[i] = 0;
+        s_speed_q16[i] = 0;
+        s_motion_x_q16[i] = 0;
+        s_motion_y_q16[i] = 0;
         s_dpad_up_prev[i] = false;
         s_dpad_down_prev[i] = false;
         s_a_prev[i] = false;
@@ -69,8 +73,9 @@ void mouse_mode_toggle(uint8_t usb_gamepad_index)
     if (usb_gamepad_index >= DONGLE_MAX_CONTROLLERS) return;
 
     s_mouse_mode[usb_gamepad_index] = !s_mouse_mode[usb_gamepad_index];
-    s_smooth_x[usb_gamepad_index] = 0;
-    s_smooth_y[usb_gamepad_index] = 0;
+    s_speed_q16[usb_gamepad_index] = 0;
+    s_motion_x_q16[usb_gamepad_index] = 0;
+    s_motion_y_q16[usb_gamepad_index] = 0;
     dongle_state_controller_set_mouse_mode(usb_gamepad_index, s_mouse_mode[usb_gamepad_index]);
 
     if (s_mouse_mode[usb_gamepad_index]) {
@@ -86,48 +91,53 @@ void mouse_mode_reset(uint8_t usb_gamepad_index)
 {
     if (usb_gamepad_index >= DONGLE_MAX_CONTROLLERS) return;
     s_mouse_mode[usb_gamepad_index] = false;
-    s_smooth_x[usb_gamepad_index] = 0;
-    s_smooth_y[usb_gamepad_index] = 0;
+    s_speed_q16[usb_gamepad_index] = 0;
+    s_motion_x_q16[usb_gamepad_index] = 0;
+    s_motion_y_q16[usb_gamepad_index] = 0;
     s_cached_valid[usb_gamepad_index] = false;
     dongle_state_controller_set_mouse_mode(usb_gamepad_index, false);
 }
 
-static int32_t apply_deadzone(int32_t v)
+static uint32_t integer_sqrt_u64(uint64_t value)
 {
-    if (v > -MOUSE_STICK_DEADZONE && v < MOUSE_STICK_DEADZONE) return 0;
-    return v;
+    uint64_t result = 0;
+    uint64_t bit = (uint64_t)1 << 62;
+
+    while (bit > value) bit >>= 2;
+    while (bit != 0) {
+        if (value >= result + bit) {
+            value -= result + bit;
+            result = (result >> 1) + bit;
+        } else {
+            result >>= 1;
+        }
+        bit >>= 2;
+    }
+    return (uint32_t)result;
 }
 
-static int8_t accelerate(int32_t v)
+static int32_t radial_speed_q16(uint32_t magnitude)
 {
-    if (v == 0) return 0;
-    int sign = (v > 0) ? 1 : -1;
-    uint32_t mag = (uint32_t)(v > 0 ? v : -v);
+    if (magnitude <= MOUSE_STICK_DEADZONE) return 0;
+    if (magnitude > 32767) magnitude = 32767;
 
-    uint32_t min_mag = MOUSE_STICK_DEADZONE;
-    if (mag <= min_mag) return 0;
-    mag -= min_mag;
+    uint32_t usable = magnitude - MOUSE_STICK_DEADZONE;
+    uint32_t full_range = 32767 - MOUSE_STICK_DEADZONE;
+    uint64_t norm = (uint64_t)usable * 32767 / full_range;
 
-    uint32_t full_range = 32767 - min_mag;
-    uint64_t norm = (uint64_t)mag * 32767 / full_range;
-
-    // Blend: 40% linear, 60% quadratic for gentler ramp-up
+    /* Apply the response curve to radial magnitude, never to X and Y
+     * independently. This preserves the stick angle through a full circle. */
     uint64_t linear = norm * 4;
     uint64_t quad = norm * norm / 32767 * 6;
     uint64_t curve = (linear + quad) / 10;
-
-    int64_t result = (int64_t)(curve * MOUSE_SPEED_MAX / 32767) * sign;
-    if (result > MOUSE_SPEED_MAX) result = MOUSE_SPEED_MAX;
-    if (result < -MOUSE_SPEED_MAX) result = -MOUSE_SPEED_MAX;
-    return (int8_t)result;
+    return (int32_t)(curve * MOUSE_SPEED_MAX * MOUSE_Q16_ONE / 32767);
 }
 
-static int32_t smooth(int32_t current, int32_t previous)
+static int32_t clamp_motion_q16(int64_t value)
 {
-    int32_t diff = current - previous;
-    if (diff > 0) return previous + (diff + 1) / 2;
-    if (diff < 0) return previous + (diff - 1) / 2;
-    return previous;
+    if (value > MOUSE_MOTION_LIMIT_Q16) return MOUSE_MOTION_LIMIT_Q16;
+    if (value < -MOUSE_MOTION_LIMIT_Q16) return -MOUSE_MOTION_LIMIT_Q16;
+    return (int32_t)value;
 }
 
 void mouse_mode_cache_state(uint8_t usb_gamepad_index, const stadia_controller_state_t *state)
@@ -144,53 +154,43 @@ void mouse_mode_process_state(uint8_t usb_gamepad_index, const stadia_controller
 
     int32_t raw_x = state->lx;
     int32_t raw_y = state->ly;
+    uint32_t magnitude = integer_sqrt_u64((uint64_t)((int64_t)raw_x * raw_x) +
+                                          (uint64_t)((int64_t)raw_y * raw_y));
+    int32_t target_speed_q16 = radial_speed_q16(magnitude);
 
-    raw_x = apply_deadzone(raw_x);
-    raw_y = apply_deadzone(raw_y);
-
-    int8_t accel_x = accelerate(raw_x);
-    int8_t accel_y = accelerate(raw_y);
-
-    // Invert Y: map_stick gives +32767 for stick UP, but USB HID mouse
-    // uses positive Y = down on most hosts. Negate to match.
-    accel_y = -accel_y;
-
-    // Circle-to-square diagonal compensation: per-axis acceleration
-    // naturally makes diagonals slower than cardinals (f(0.707)² combined
-    // < f(1.0) for any sub-linear curve).  Boost non-cardinal directions
-    // so cursor speed is independent of stick angle.
-    {
-        int32_t ax = accel_x > 0 ? accel_x : -accel_x;
-        int32_t ay = accel_y > 0 ? accel_y : -accel_y;
-        if (ax > ay && ax > 0) {
-            int32_t boost = 256 + ay * 54 / ax;
-            accel_x = (int8_t)((int32_t)accel_x * boost / 256);
-            accel_y = (int8_t)((int32_t)accel_y * boost / 256);
-        } else if (ay > 0) {
-            int32_t boost = 256 + ax * 54 / ay;
-            accel_x = (int8_t)((int32_t)accel_x * boost / 256);
-            accel_y = (int8_t)((int32_t)accel_y * boost / 256);
+    if (state->lt > 128) target_speed_q16 /= MOUSE_PRECISION_DIV;
+    if (state->rt > 128) {
+        target_speed_q16 *= MOUSE_FAST_MUL;
+        if (target_speed_q16 > MOUSE_SPEED_MAX * MOUSE_Q16_ONE) {
+            target_speed_q16 = MOUSE_SPEED_MAX * MOUSE_Q16_ONE;
         }
     }
 
-    if (state->lt > 128) {
-        accel_x = accel_x / MOUSE_PRECISION_DIV;
-        accel_y = accel_y / MOUSE_PRECISION_DIV;
-    }
+    int32_t velocity_x_q16 = 0;
+    int32_t velocity_y_q16 = 0;
+    if (target_speed_q16 == 0 || magnitude == 0) {
+        /* Stop immediately inside the radial deadzone: no smoothing tail or
+         * old fractional movement may make the cursor drift after release. */
+        s_speed_q16[usb_gamepad_index] = 0;
+        s_motion_x_q16[usb_gamepad_index] = 0;
+        s_motion_y_q16[usb_gamepad_index] = 0;
+    } else {
+        /* Smooth magnitude only. The current stick direction is always used
+         * immediately, so direction changes never inherit an old X/Y vector. */
+        int32_t speed_delta = target_speed_q16 - s_speed_q16[usb_gamepad_index];
+        s_speed_q16[usb_gamepad_index] += speed_delta / 2;
+        if (s_speed_q16[usb_gamepad_index] == 0) s_speed_q16[usb_gamepad_index] = 1;
 
-    if (state->rt > 128) {
-        int fast_x = accel_x * MOUSE_FAST_MUL;
-        int fast_y = accel_y * MOUSE_FAST_MUL;
-        if (fast_x > MOUSE_SPEED_MAX) fast_x = MOUSE_SPEED_MAX;
-        if (fast_x < -MOUSE_SPEED_MAX) fast_x = -MOUSE_SPEED_MAX;
-        if (fast_y > MOUSE_SPEED_MAX) fast_y = MOUSE_SPEED_MAX;
-        if (fast_y < -MOUSE_SPEED_MAX) fast_y = -MOUSE_SPEED_MAX;
-        accel_x = (int8_t)fast_x;
-        accel_y = (int8_t)fast_y;
+        velocity_x_q16 = (int32_t)((int64_t)s_speed_q16[usb_gamepad_index] * raw_x /
+                                   (int32_t)magnitude);
+        /* Stadia +Y is up; USB mouse +Y is down. */
+        velocity_y_q16 = -(int32_t)((int64_t)s_speed_q16[usb_gamepad_index] * raw_y /
+                                    (int32_t)magnitude);
+        s_motion_x_q16[usb_gamepad_index] = clamp_motion_q16(
+            (int64_t)s_motion_x_q16[usb_gamepad_index] + velocity_x_q16);
+        s_motion_y_q16[usb_gamepad_index] = clamp_motion_q16(
+            (int64_t)s_motion_y_q16[usb_gamepad_index] + velocity_y_q16);
     }
-
-    s_smooth_x[usb_gamepad_index] = smooth(accel_x, s_smooth_x[usb_gamepad_index]);
-    s_smooth_y[usb_gamepad_index] = smooth(accel_y, s_smooth_y[usb_gamepad_index]);
 
     uint8_t buttons = 0;
     if (state->a) buttons |= 0x01;
@@ -207,14 +207,14 @@ void mouse_mode_process_state(uint8_t usb_gamepad_index, const stadia_controller
     {
         int32_t sr = state->ry;
         if (sr > -MOUSE_SCROLL_DEADZONE && sr < MOUSE_SCROLL_DEADZONE) sr = 0;
-        s_scroll_accum[usb_gamepad_index] += (int64_t)sr * 160 / 32767;
+        s_scroll_accum[usb_gamepad_index] += (int64_t)sr * 32 / 32767;
         int8_t st = (int8_t)(s_scroll_accum[usb_gamepad_index] / 256);
         s_scroll_accum[usb_gamepad_index] -= (int32_t)st * 256;
         wheel += st;
     }
 
-    int8_t out_x = (int8_t)s_smooth_x[usb_gamepad_index];
-    int8_t out_y = (int8_t)s_smooth_y[usb_gamepad_index];
+    int8_t out_x = (int8_t)(s_motion_x_q16[usb_gamepad_index] / MOUSE_Q16_ONE);
+    int8_t out_y = (int8_t)(s_motion_y_q16[usb_gamepad_index] / MOUSE_Q16_ONE);
 
     if (out_x == 0 && out_y == 0 && wheel == 0 &&
         buttons == (uint8_t)((s_a_prev[usb_gamepad_index] ? 0x01 : 0) |
@@ -223,11 +223,13 @@ void mouse_mode_process_state(uint8_t usb_gamepad_index, const stadia_controller
         return;
     }
 
-    s_a_prev[usb_gamepad_index] = state->a;
-    s_b_prev[usb_gamepad_index] = state->b;
-    s_x_prev[usb_gamepad_index] = state->x;
-
-    hid_mouse_send_report(buttons, out_x, out_y, wheel);
+    if (hid_mouse_send_report(buttons, out_x, out_y, wheel)) {
+        s_motion_x_q16[usb_gamepad_index] -= (int32_t)out_x * MOUSE_Q16_ONE;
+        s_motion_y_q16[usb_gamepad_index] -= (int32_t)out_y * MOUSE_Q16_ONE;
+        s_a_prev[usb_gamepad_index] = state->a;
+        s_b_prev[usb_gamepad_index] = state->b;
+        s_x_prev[usb_gamepad_index] = state->x;
+    }
 }
 
 void mouse_mode_timer_task(void *arg)
