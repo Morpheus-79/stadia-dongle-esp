@@ -1,9 +1,10 @@
 /*
  * bridge.c — Translation between Stadia BLE input reports and Xbox 360 USB reports.
  *
- * Stadia BLE notification payload (10 bytes, no Report ID; byte 9 purpose
- * unconfirmed — a candidate battery level, logged by ble_central.c for
- * comparison against the Battery Service):
+ * Stadia BLE notification payload (10 bytes, no Report ID; byte 9 is padding,
+ * observed constant 0x00 across a session with the Battery Service reporting
+ * 51%, so it is not a battery level or a sequence counter — battery comes from
+ * the Battery Service in ble_central.c):
  *   [0] D-pad hat (0=Up … 7=Up-L, >7=neutral)
  *   [1] bits 7=RS, 6=OPTIONS, 5=MENU, 4=STADIA_BTN
  *   [2] bits 6=A, 5=B, 4=X, 3=Y, 2=LB, 1=RB, 0=LS

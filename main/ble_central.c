@@ -102,13 +102,6 @@ typedef struct {
     int battery_percent;
     bool battery_available;
 
-    /* Diagnostic: byte 9 of the input report is of unconfirmed purpose. Another
-     * Stadia bridge implementation reads it as a battery level. Track it so its
-     * value can be compared against the Battery Service reading. */
-    uint8_t report_byte9;
-    bool report_byte9_valid;
-    uint16_t report_len;
-
     stadia_controller_state_t stadia_state;
     uint8_t usb_gamepad_index;
     bool last_report_valid;
@@ -739,11 +732,7 @@ static int battery_read_cb(uint16_t conn_handle, const struct ble_gatt_error *er
             slot->battery_percent = pct;
             slot->battery_available = true;
             dongle_state_controller_set_battery(slot->slot_index, pct);
-            /* byte9 is printed alongside so the two can be compared directly. */
-            ESP_LOGI(TAG, "slot %u battery level: %u%% (report byte9=%d report_len=%u)",
-                     slot->slot_index, pct,
-                     slot->report_byte9_valid ? (int)slot->report_byte9 : -1,
-                     slot->report_len);
+            ESP_LOGI(TAG, "slot %u battery level: %u%%", slot->slot_index, pct);
         }
     } else if (err->status != 0) {
         ESP_LOGW(TAG, "slot %u battery read failed: %d", slot->slot_index, err->status);
@@ -1055,17 +1044,6 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
         }
         slot->last_input_us = esp_timer_get_time();
         slot->input_report_count++;
-        slot->report_len = len;
-        /* Log byte 9 only when it changes, so a whole play session costs a
-         * handful of lines. If it tracks the Battery Service percentage the
-         * 60 s GATT poll can be dropped in favour of reading it here. */
-        if (len >= 10 && (!slot->report_byte9_valid || raw[9] != slot->report_byte9)) {
-            slot->report_byte9 = raw[9];
-            slot->report_byte9_valid = true;
-            ESP_LOGI(TAG, "slot %u byte9=%u (0x%02x) report_len=%u battery_service=%d%% reports=%lu",
-                     slot->slot_index, raw[9], raw[9], len, slot->battery_percent,
-                     (unsigned long)slot->input_report_count);
-        }
         uint8_t xbox[DONGLE_XBOX_REPORT_SIZE];
         stadia_controller_state_t state;
         stadia_parse_state(raw, len, &state);
