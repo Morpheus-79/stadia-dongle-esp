@@ -27,6 +27,9 @@ idf.py set-target esp32s3
 idf.py build
 ```
 
+On Windows, double-click `build_firmware.cmd` for the same build. From a
+terminal, pass `--no-pause` to suppress the final prompt.
+
 `sdkconfig.defaults` pre-configures NimBLE central, TinyUSB, 240 MHz CPU, and
 production logging. The default partition table fits 4 MB flash with dual OTA
 slots.
@@ -37,6 +40,19 @@ slots.
 idf.py -p <PORT> flash
 ```
 
+On Windows, double-click `flash_firmware.cmd` and enter the COM port. It builds
+changed files before flashing. Command-line examples:
+
+```bat
+flash_firmware.cmd COM5
+flash_firmware.cmd COM5 --no-pause
+flash_firmware.cmd COM5 --dry-run --no-pause
+```
+
+To view live ESP32 logs, double-click `monitor_logs.cmd` and enter the COM port,
+or run `monitor_logs.cmd COM5` from a terminal. Press **Ctrl+]** to stop the
+monitor. Run `build_firmware.cmd` first if the build folder is missing.
+
 Merged binary for the [ESP Web Tools](https://esphome.github.io/esp-web-tools/)
 installer:
 
@@ -46,8 +62,15 @@ esptool.py --chip esp32s3 merge_bin \
   --flash_mode dio --flash_freq 80m --flash_size 4MB \
   0x0 build/bootloader/bootloader.bin \
   0x8000 build/partition_table/partition-table.bin \
+  0xf000 build/ota_data_initial.bin \
   0x20000 build/stadia-dongle.bin
 ```
+
+The application offset must be `0x20000` to match `ota_0` in `partitions.csv`.
+
+On Windows, run `create_merged_fw.cmd`. It builds first when required and
+creates `docs/firmware-merged.bin`. Pass `16MB` when targeting a 16 MB board.
+`flash_merged.cmd COM5` writes that image to a device over serial.
 
 Host the `docs/` folder and open `docs/index.html` in Chrome/Edge.
 
@@ -151,8 +174,10 @@ timeout (default 120 s) when a controller is connected.
 
 ## USB Remote Wake
 
-When the host PC sleeps, pressing **Stadia, Assistant, Capture, or A** sends a
-remote wake signal via `tud_remote_wakeup()`. Requires BIOS/OS USB wake support. Not always working. 
+When the host PC sleeps, pressing **Assistant, Capture, or A** sends a remote
+wake signal via `tud_remote_wakeup()`. The **Stadia/Guide** button intentionally
+does not wake the PC, so it can be held to turn off the controller. Requires
+BIOS/OS USB wake support. Not always working.
 
 ## LED Reference
 
