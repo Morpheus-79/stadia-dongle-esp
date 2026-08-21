@@ -21,9 +21,12 @@ static bool s_a_prev[DONGLE_MAX_CONTROLLERS];
 static bool s_b_prev[DONGLE_MAX_CONTROLLERS];
 static bool s_x_prev[DONGLE_MAX_CONTROLLERS];
 static int32_t s_scroll_accum[DONGLE_MAX_CONTROLLERS];
-/* Whole detents produced but not yet accepted by the host: D-pad presses, plus
+/* Wheel counts produced but not yet accepted by the host: D-pad presses, plus
  * anything a failed or clamped report left undelivered. */
 static int32_t s_wheel_pending[DONGLE_MAX_CONTROLLERS];
+/* Counts per detent last seen from the HID layer, to notice the host turning
+ * high-resolution scrolling on or off. */
+static uint8_t s_wheel_mult_prev = 1;
 static stadia_controller_state_t s_cached_state[DONGLE_MAX_CONTROLLERS];
 static bool s_cached_valid[DONGLE_MAX_CONTROLLERS];
 
@@ -48,7 +51,8 @@ static bool s_cached_valid[DONGLE_MAX_CONTROLLERS];
 #define MOUSE_SCROLL_MAX_Q16 ((MOUSE_SCROLL_MAX_PER_S * MOUSE_Q16_ONE) / MOUSE_TICK_HZ)
 
 /* Cap on undelivered scroll, so a host that stops polling cannot build up a
- * backlog that unloads in one burst when it resumes. */
+ * backlog that unloads in one burst when it resumes. Both are in detents and
+ * are scaled by the wheel multiplier at the point of use. */
 #define MOUSE_SCROLL_ACCUM_LIMIT_Q16 (16 * MOUSE_Q16_ONE)
 #define MOUSE_WHEEL_PENDING_LIMIT 16
 
@@ -250,13 +254,25 @@ void mouse_mode_process_state(uint8_t usb_gamepad_index, const stadia_controller
     if (state->b) buttons |= 0x02;
     if (state->x) buttons |= 0x04;
 
+    /* One detent is wheel_mult counts once the host has enabled high-resolution
+     * scrolling. Both accumulators below are held in counts, so a change of
+     * multiplier changes their unit and they have to start clean. */
+    uint8_t wheel_mult = hid_mouse_wheel_multiplier();
+    if (wheel_mult != s_wheel_mult_prev) {
+        for (uint8_t i = 0; i < DONGLE_MAX_CONTROLLERS; i++) {
+            s_scroll_accum[i] = 0;
+            s_wheel_pending[i] = 0;
+        }
+        s_wheel_mult_prev = wheel_mult;
+    }
+
     /* D-pad detents join the pending count rather than going straight into the
      * report, so a press is retried if the report cannot be delivered. */
     if (state->dpad_up && !s_dpad_up_prev[usb_gamepad_index]) {
-        s_wheel_pending[usb_gamepad_index]++;
+        s_wheel_pending[usb_gamepad_index] += wheel_mult;
     }
     if (state->dpad_down && !s_dpad_down_prev[usb_gamepad_index]) {
-        s_wheel_pending[usb_gamepad_index]--;
+        s_wheel_pending[usb_gamepad_index] -= wheel_mult;
     }
     s_dpad_up_prev[usb_gamepad_index] = state->dpad_up;
     s_dpad_down_prev[usb_gamepad_index] = state->dpad_down;
@@ -267,21 +283,24 @@ void mouse_mode_process_state(uint8_t usb_gamepad_index, const stadia_controller
          * starts from rest instead of emitting an immediate stray detent. */
         s_scroll_accum[usb_gamepad_index] = 0;
     } else {
-        int64_t accum = (int64_t)s_scroll_accum[usb_gamepad_index] + scroll_step;
-        if (accum > MOUSE_SCROLL_ACCUM_LIMIT_Q16) accum = MOUSE_SCROLL_ACCUM_LIMIT_Q16;
-        if (accum < -MOUSE_SCROLL_ACCUM_LIMIT_Q16) accum = -MOUSE_SCROLL_ACCUM_LIMIT_Q16;
+        int64_t limit = (int64_t)MOUSE_SCROLL_ACCUM_LIMIT_Q16 * wheel_mult;
+        int64_t accum = (int64_t)s_scroll_accum[usb_gamepad_index] +
+                        (int64_t)scroll_step * wheel_mult;
+        if (accum > limit) accum = limit;
+        if (accum < -limit) accum = -limit;
         s_scroll_accum[usb_gamepad_index] = (int32_t)accum;
     }
 
-    if (s_wheel_pending[usb_gamepad_index] > MOUSE_WHEEL_PENDING_LIMIT) {
-        s_wheel_pending[usb_gamepad_index] = MOUSE_WHEEL_PENDING_LIMIT;
+    int32_t pending_limit = MOUSE_WHEEL_PENDING_LIMIT * (int32_t)wheel_mult;
+    if (s_wheel_pending[usb_gamepad_index] > pending_limit) {
+        s_wheel_pending[usb_gamepad_index] = pending_limit;
     }
-    if (s_wheel_pending[usb_gamepad_index] < -MOUSE_WHEEL_PENDING_LIMIT) {
-        s_wheel_pending[usb_gamepad_index] = -MOUSE_WHEEL_PENDING_LIMIT;
+    if (s_wheel_pending[usb_gamepad_index] < -pending_limit) {
+        s_wheel_pending[usb_gamepad_index] = -pending_limit;
     }
 
-    int32_t scroll_detents = s_scroll_accum[usb_gamepad_index] / MOUSE_Q16_ONE;
-    int32_t wheel_want = scroll_detents + s_wheel_pending[usb_gamepad_index];
+    int32_t scroll_counts = s_scroll_accum[usb_gamepad_index] / MOUSE_Q16_ONE;
+    int32_t wheel_want = scroll_counts + s_wheel_pending[usb_gamepad_index];
     int32_t wheel_send = wheel_want;
     if (wheel_send > 127) wheel_send = 127;
     if (wheel_send < -127) wheel_send = -127;
@@ -302,7 +321,7 @@ void mouse_mode_process_state(uint8_t usb_gamepad_index, const stadia_controller
         s_motion_y_q16[usb_gamepad_index] -= (int32_t)out_y * MOUSE_Q16_ONE;
         /* Consume only what the host actually took. Anything the int8 wheel
          * field could not carry stays pending for the next report. */
-        s_scroll_accum[usb_gamepad_index] -= scroll_detents * MOUSE_Q16_ONE;
+        s_scroll_accum[usb_gamepad_index] -= scroll_counts * MOUSE_Q16_ONE;
         s_wheel_pending[usb_gamepad_index] = wheel_want - wheel_send;
         s_a_prev[usb_gamepad_index] = state->a;
         s_b_prev[usb_gamepad_index] = state->b;
