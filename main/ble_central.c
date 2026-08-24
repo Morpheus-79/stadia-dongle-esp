@@ -106,6 +106,7 @@ typedef struct {
     uint8_t usb_gamepad_index;
     bool last_report_valid;
     uint8_t last_xbox_report[DONGLE_XBOX_REPORT_SIZE];
+    int64_t connect_started_us;
     int64_t connected_at_us;
     int64_t ready_at_us;
     int64_t last_input_us;
@@ -173,6 +174,11 @@ static const char *ble_status_name(int status)
     if (status == BLE_HS_ENOTCONN) return "not-connected";
     if (status == BLE_HS_ETIMEOUT) return "host-timeout";
     if (status == BLE_HS_HCI_ERR(BLE_ERR_CONN_SPVN_TMO)) return "connection-supervision-timeout";
+    if (status == BLE_HS_HCI_ERR(BLE_ERR_CONN_ESTABLISHMENT)) return "connection-failed-to-establish";
+    if (status == BLE_HS_HCI_ERR(BLE_ERR_UNK_CONN_ID)) return "unknown-connection-id";
+    /* ATT errors, not HCI: the peer's GATT server rejected the request. */
+    if (status == BLE_HS_ATT_ERR(BLE_ATT_ERR_INVALID_HANDLE)) return "att-invalid-handle";
+    if (status == BLE_HS_ATT_ERR(BLE_ATT_ERR_INSUFFICIENT_AUTHEN)) return "att-insufficient-authentication";
     if (status == BLE_HS_HCI_ERR(BLE_ERR_PINKEY_MISSING)) return "pin-or-key-missing";
     if (status == BLE_HS_HCI_ERR(BLE_ERR_AUTH_FAIL)) return "authentication-failure";
     if (status == BLE_HS_HCI_ERR(BLE_ERR_REM_USER_CONN_TERM)) return "remote-user-terminated";
@@ -262,6 +268,29 @@ static controller_slot_t *slot_by_conn(uint16_t conn_handle)
     return NULL;
 }
 
+/*
+ * Recover the slot handed to ble_gap_connect() from the GAP callback argument.
+ *
+ * NimBLE reports a connection that never established -- including the failures
+ * of its own internal reattempts -- as a disconnect carrying a handle that was
+ * never assigned to any slot, so slot_by_conn() cannot find it. Only accept a
+ * slot that is still waiting on that attempt; anything holding a real handle
+ * belongs to a live connection and must not be touched.
+ */
+static controller_slot_t *slot_from_connect_arg(void *arg)
+{
+    if (!arg) return NULL;
+    for (uint8_t i = 0; i < DONGLE_MAX_CONTROLLERS; i++) {
+        controller_slot_t *slot = &s_slots[i];
+        if (slot != arg) continue;
+        if (!slot->used) return NULL;
+        if (slot->conn_handle != BLE_HS_CONN_HANDLE_NONE) return NULL;
+        if (slot->state != CONTROLLER_SLOT_CONNECTING) return NULL;
+        return slot;
+    }
+    return NULL;
+}
+
 static controller_slot_t *slot_by_addr(const ble_addr_t *addr)
 {
     for (uint8_t i = 0; i < DONGLE_MAX_CONTROLLERS; i++) {
@@ -314,6 +343,7 @@ static controller_slot_t *alloc_slot(const ble_addr_t *addr)
             slot->usb_gamepad_index = i;
             slot->battery_percent = -1;
             slot->state = CONTROLLER_SLOT_CONNECTING;
+            slot->connect_started_us = esp_timer_get_time();
             addr_to_str(addr, slot->addr_str, sizeof(slot->addr_str));
             snprintf(slot->name, sizeof(slot->name), "Stadia Controller");
             dongle_state_controller_set_info(i, i, slot->addr_str, slot->name, false);
@@ -384,9 +414,44 @@ static void reconnect_timer_cb(void *arg)
     start_scan();
 }
 
+/*
+ * Backstop for the slot leak fixed in gap_event_fn(): if a connect attempt ever
+ * ends without either a failed-connect or a disconnect event we can attribute,
+ * the slot would stay allocated forever and the dongle would need a power cycle
+ * to accept that controller again. A connect is given 5 s by ble_gap_connect()
+ * and NimBLE retries a few times, so anything still connecting after a minute
+ * is stale. Piggybacks on the battery tick, hence the coarse granularity: this
+ * is a safety net, not the normal path.
+ */
+#define BLE_CONNECT_STALE_US 60000000
+
+static void sweep_stale_connect_slots(void)
+{
+    int64_t now_us = esp_timer_get_time();
+    for (uint8_t i = 0; i < DONGLE_MAX_CONTROLLERS; i++) {
+        controller_slot_t *slot = &s_slots[i];
+        if (!slot->used) continue;
+        if (slot->state != CONTROLLER_SLOT_CONNECTING) continue;
+        if (slot->conn_handle != BLE_HS_CONN_HANDLE_NONE) continue;
+        if (!slot->connect_started_us) continue;
+        if (now_us - slot->connect_started_us < BLE_CONNECT_STALE_US) continue;
+
+        ESP_LOGW(TAG, "slot %u stuck connecting for %lld ms addr=%s; reclaiming",
+                 slot->slot_index, (long long)((now_us - slot->connect_started_us) / 1000),
+                 slot->addr_str);
+        setup_retry_note_failure(&slot->peer_addr);
+        clear_slot(slot);
+        if (s_scan_lock) xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+        s_force_active_scan = true;
+        if (s_scan_lock) xSemaphoreGive(s_scan_lock);
+        start_scan();
+    }
+}
+
 static void battery_timer_cb(void *arg)
 {
     (void)arg;
+    sweep_stale_connect_slots();
     for (uint8_t i = 0; i < DONGLE_MAX_CONTROLLERS; i++) {
         controller_slot_t *slot = &s_slots[i];
         if (slot->used && slot->state == CONTROLLER_SLOT_READY && slot->battery_val_handle) {
@@ -735,7 +800,8 @@ static int battery_read_cb(uint16_t conn_handle, const struct ble_gatt_error *er
             ESP_LOGI(TAG, "slot %u battery level: %u%%", slot->slot_index, pct);
         }
     } else if (err->status != 0) {
-        ESP_LOGW(TAG, "slot %u battery read failed: %d", slot->slot_index, err->status);
+        ESP_LOGW(TAG, "slot %u battery read failed: %d (%s)", slot->slot_index,
+                 err->status, ble_status_name(err->status));
     }
     return 0;
 }
@@ -990,6 +1056,13 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_DISCONNECT: {
         controller_slot_t *slot = slot_by_conn(event->disconnect.conn.conn_handle);
+        if (!slot) {
+            /* A connect attempt that never established. Without this the slot
+             * stays allocated forever: occupied_slots() keeps reporting it,
+             * which holds scanning at the connected duty cycle and eventually
+             * leaves no slot for the controller to come back to. */
+            slot = slot_from_connect_arg(arg);
+        }
         uint8_t usb = slot ? slot->usb_gamepad_index : 0;
         controller_slot_state_t previous_state = slot ? slot->state : CONTROLLER_SLOT_EMPTY;
         int64_t now_us = esp_timer_get_time();
