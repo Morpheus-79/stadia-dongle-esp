@@ -141,6 +141,7 @@ const char *config_store_action_name(uint8_t action)
     case DONGLE_ACTION_CONSUMER_MUTE: return "mute";
     case DONGLE_ACTION_CONSUMER_SCAN_NEXT: return "next_track";
     case DONGLE_ACTION_CONSUMER_SCAN_PREV: return "prev_track";
+    case DONGLE_ACTION_KEY_F12: return "f12";
     default: return "none";
     }
 }
@@ -184,5 +185,6 @@ uint8_t config_store_action_from_name(const char *name)
     if (strcmp(name, "mute") == 0) return DONGLE_ACTION_CONSUMER_MUTE;
     if (strcmp(name, "next_track") == 0) return DONGLE_ACTION_CONSUMER_SCAN_NEXT;
     if (strcmp(name, "prev_track") == 0) return DONGLE_ACTION_CONSUMER_SCAN_PREV;
+    if (strcmp(name, "f12") == 0) return DONGLE_ACTION_KEY_F12;
     return DONGLE_ACTION_NONE;
 }

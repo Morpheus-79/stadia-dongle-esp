@@ -93,8 +93,9 @@ export const ACTIONS = Object.freeze([
   { value: 32, name: "arrow_left", label: "Arrow Left" },
   { value: 33, name: "arrow_right", label: "Arrow Right" },
   { value: 34, name: "mute", label: "Mute" },
-  { value: 35, name: "scan_next", label: "Next Track" },
-  { value: 36, name: "scan_prev", label: "Previous Track" },
+  { value: 35, name: "next_track", label: "Next Track" },
+  { value: 36, name: "prev_track", label: "Previous Track" },
+  { value: 37, name: "f12", label: "F12 (Steam screenshot)" },
 ]);
 
 export const DONGLE_STATES = Object.freeze([

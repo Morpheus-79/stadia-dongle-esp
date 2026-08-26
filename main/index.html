@@ -17,7 +17,7 @@ button,input,select{font:inherit;border-radius:11px;border:1px solid #49617c;bac
 </div></main><script>
 const $=id=>document.getElementById(id);
 let currentAddr='';
-const actions=['none','f13','f14','f15','f16','f17','f18','f19','f20','f21','f22','f23','f24','printscreen','escape','tab','space','enter','backspace','insert','delete','home','end','page_up','page_down','arrow_up','arrow_down','arrow_left','arrow_right','volume_up','volume_down','mute','play_pause','next_track','prev_track','start_webui','remote_wake_only'];
+const actions=['none','f12','f13','f14','f15','f16','f17','f18','f19','f20','f21','f22','f23','f24','printscreen','escape','tab','space','enter','backspace','insert','delete','home','end','page_up','page_down','arrow_up','arrow_down','arrow_left','arrow_right','volume_up','volume_down','mute','play_pause','next_track','prev_track','start_webui','remote_wake_only'];
 for(const id of ['as','al','cs','cl']){let s=$(id);actions.forEach(a=>s.add(new Option(a,a)));}
 async function api(p,o={}){let c=new AbortController(),tm=setTimeout(()=>c.abort(),10000);try{let r=await fetch(p,{...o,signal:c.signal});let t=r.headers.get('content-type')||'';let v=t.includes('json')?await r.json():await r.text();if(!r.ok)throw new Error(typeof v==='string'?v:JSON.stringify(v));return v}catch(e){if(e.name==='AbortError')throw new Error('request timed out');throw e}finally{clearTimeout(tm)}}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}

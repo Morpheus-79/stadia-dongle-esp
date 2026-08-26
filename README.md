@@ -151,10 +151,20 @@ HID interface. Defaults:
 | Assistant | F14         | Start Web UI     |
 | Capture   | PrintScreen | *(none)*         |
 
-All actions are remappable in the Web UI. 38 actions available: F13–F24,
-PrintScreen, Escape, Space, Enter, Tab, Backspace, Insert, Delete, Home, End,
-Page Up/Down, arrow keys, volume/mute, media playback, remote wake only, and
-Start Web UI.
+All actions are remappable in the Web UI or over USB. Available actions:
+F12–F24 (F12 triggers Steam's screenshot shortcut), PrintScreen, Escape, Space,
+Enter, Tab, Backspace, Insert, Delete, Home, End, Page Up/Down, arrow keys,
+volume/mute, media playback, remote wake only, and Start Web UI.
+
+## USB Configuration (no Wi-Fi needed)
+
+With the dongle plugged into its native USB port, open the
+[USB configuration page](https://danzig666.github.io/stadia-dongle-esp/config.html)
+in Chrome or Edge. It talks to the dongle over WebHID — pairing, button
+remapping, the controller list, live input and Wi-Fi control, without joining
+the dongle's AP. Protocol details in
+[docs/usb-config-protocol.md](docs/usb-config-protocol.md); designed by
+[jazz-zzzz](https://github.com/jazz-zzzz/stadia-dongle-esp).
 
 ## Web UI
 

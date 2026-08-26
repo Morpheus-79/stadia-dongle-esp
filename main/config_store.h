@@ -43,6 +43,9 @@ typedef enum {
     DONGLE_ACTION_CONSUMER_MUTE,
     DONGLE_ACTION_CONSUMER_SCAN_NEXT,
     DONGLE_ACTION_CONSUMER_SCAN_PREV,
+    /* Append only: these values are persisted in NVS and used verbatim by the
+     * USB configuration protocol. */
+    DONGLE_ACTION_KEY_F12,
 } dongle_action_t;
 
 typedef struct {

@@ -111,7 +111,7 @@ static uint32_t pressed_mask(const stadia_controller_state_t *state)
 
 static bool action_valid(uint8_t action)
 {
-    return action <= DONGLE_ACTION_CONSUMER_SCAN_PREV;
+    return action <= DONGLE_ACTION_KEY_F12;
 }
 
 static bool command_needs_controller_manager(uint8_t command)
