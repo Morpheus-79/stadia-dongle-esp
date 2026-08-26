@@ -816,6 +816,16 @@ void web_server_request_start(bool explicit_request)
     s_start_requested = true;
 }
 
+void web_server_request_stop(void)
+{
+    s_stop_requested = true;
+}
+
+void web_server_notify_config_changed(void)
+{
+    s_deadline_set = false;
+}
+
 void web_server_stop(void)
 {
     if (s_httpd) {
