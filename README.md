@@ -6,6 +6,9 @@ captive portal for pairing, button remapping, and OTA updates.
 
 Forked from [Scalee/stadia-dongle](https://github.com/Scalee/stadia-dongle).
 
+> ### ⚡ [Flash the firmware](https://danzig666.github.io/stadia-dongle-esp/) · 🛠️ [Configure over USB](https://danzig666.github.io/stadia-dongle-esp/config.html)
+> Both run in desktop Chrome/Edge, talk directly to the device, and need no software installed.
+
 ## Requirements
 
 - **ESP32-S3** module with native USB OTG
@@ -14,11 +17,13 @@ Forked from [Scalee/stadia-dongle](https://github.com/Scalee/stadia-dongle).
 - [ESP-IDF v6.x](https://github.com/espressif/esp-idf)
 
 ## Flashing
-No software needed: use the web installer in Chrome or Edge.
 
-[danzig666.github.io/stadia-dongle-esp](https://danzig666.github.io/stadia-dongle-esp/)
-
-Connect the ESP32-S3 via the COM/UART USB port, click Install, then move it to the native USB port after flashing.
+No software needed: use the
+[web installer](https://danzig666.github.io/stadia-dongle-esp/) in Chrome or
+Edge. Connect the ESP32-S3 via the COM/UART USB port, click Install, then move
+it to the native USB port after flashing. Once flashed, the
+[USB configuration page](https://danzig666.github.io/stadia-dongle-esp/config.html)
+manages pairing and settings over the same cable.
 
 ## Build
 
