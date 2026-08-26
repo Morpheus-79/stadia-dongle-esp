@@ -76,13 +76,13 @@ Host the `docs/` folder and open `docs/index.html` in Chrome/Edge.
 
 ## Setup
 
-1. Flash the firmware.
-2. On first boot, the dongle starts a setup AP automatically.
-3. Join Wi-Fi **`StadiaDongle-XXXX`** (open, no password).
-4. Open `http://192.168.4.1` (captive portal should redirect).
-5. Click **Start Pairing**, then put the controller in Bluetooth mode
-   (hold **Stadia + Y** until orange flash). This is not really needed, it auto pairs available controllers.
-6. Once bonded, the dongle auto-connects on future boots.
+1. Flash the firmware and plug the dongle into the native USB port.
+2. Put the controller in Bluetooth mode (hold **Stadia + Y** until orange
+   flash). A dongle with no bonds auto-pairs it -- no page or app needed.
+3. Once bonded, the dongle auto-connects on future boots.
+4. To remap buttons or change settings, open the
+   [USB configuration page](https://danzig666.github.io/stadia-dongle-esp/config.html)
+   in Chrome/Edge, or start the Wi-Fi Web UI (below).
 
 ## Controller Modes
 
@@ -178,11 +178,12 @@ Access at `http://192.168.4.1` when the AP is active. Provides:
 - Firmware update upload (OTA) - untested
 - Reboot and disable-Web-UI
 
-The AP starts on fresh flash, when no bonds exist, or by holding
-**Assistant** button. It auto-disables after a configurable
-timeout (default 120 s) when a controller is connected. Once a controller is
-bonded, the AP stays off at boot so the 2.4 GHz radio is free for controller
-traffic; hold **Assistant** whenever you need the Web UI.
+The AP never starts on its own: the 2.4 GHz radio is shared with the
+controller links, and USB covers configuration. Start it by holding
+**Assistant** on a connected controller, or from the USB configuration page.
+It auto-disables after a configurable timeout (default 120 s) when a
+controller is connected. The old start-at-boot-until-bonded behaviour can be
+re-enabled with the "auto-start when no controller is bonded" option.
 
 ## USB Remote Wake
 

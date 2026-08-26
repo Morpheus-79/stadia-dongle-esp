@@ -293,7 +293,7 @@
       if (!transport) return;
       await transport.command(CMD.PING);
       const info = decodeDeviceInfo(await transport.command(CMD.GET_DEVICE_INFO));
-      $("conn-state").textContent = `connected — ${info.firmware_version}`;
+      $("conn-state").textContent = `connected — fw ${info.firmware_version}`;
       $("conn-state").classList.add("on");
       for (const id of ["card-status", "card-config", "card-controllers", "card-live", "card-system"]) {
         $(id).classList.remove("hidden");

@@ -10,7 +10,7 @@
 
 #define CFG_NS "dongle_cfg"
 #define CFG_KEY "config"
-#define CFG_SCHEMA 3
+#define CFG_SCHEMA 4
 
 static const char *TAG = "CFG";
 
@@ -26,7 +26,12 @@ void config_store_defaults(dongle_config_t *cfg)
     cfg->capture_short_action = DONGLE_ACTION_KEY_PRINTSCREEN;
     cfg->capture_long_action = DONGLE_ACTION_NONE;
     cfg->long_press_ms = 1000;
-    cfg->webui_auto_start_if_no_bond = true;
+    /* Off by default: pairing works with no UI (a fresh dongle auto-scans for
+     * any Stadia controller) and configuration is available over USB, so the
+     * AP only runs when the user asks for it -- Assistant long-press or the
+     * USB configuration page. Enabling this restores the old behaviour of
+     * starting the setup AP at boot while no controller is bonded. */
+    cfg->webui_auto_start_if_no_bond = false;
     cfg->webui_timeout_after_ble_connected_ms = 120000;
     cfg->disable_ap_on_usb_suspend = true;
 }
@@ -40,15 +45,20 @@ void config_store_init(void)
     if (nvs_open(CFG_NS, NVS_READWRITE, &nvs) != ESP_OK) return;
     size_t len = sizeof(s_cfg);
     esp_err_t err = nvs_get_blob(nvs, CFG_KEY, &s_cfg, &len);
-    if (err == ESP_OK && s_cfg.schema_version == 1) {
+    if (err == ESP_OK && s_cfg.schema_version >= 1 && s_cfg.schema_version < CFG_SCHEMA) {
+        /* Chained migrations: apply every step between the stored version and
+         * the current schema, preserving the user's other settings. */
+        if (s_cfg.schema_version < 2) {
+            s_cfg.webui_timeout_after_ble_connected_ms = 120000;
+        }
+        if (s_cfg.schema_version < 3) {
+            s_cfg.disable_ap_on_usb_suspend = true;
+        }
+        if (s_cfg.schema_version < 4) {
+            /* The AP became opt-in; see config_store_defaults(). */
+            s_cfg.webui_auto_start_if_no_bond = false;
+        }
         s_cfg.schema_version = CFG_SCHEMA;
-        s_cfg.webui_timeout_after_ble_connected_ms = 120000;
-        s_cfg.disable_ap_on_usb_suspend = true;
-        nvs_set_blob(nvs, CFG_KEY, &s_cfg, sizeof(s_cfg));
-        nvs_commit(nvs);
-    } else if (err == ESP_OK && s_cfg.schema_version == 2) {
-        s_cfg.schema_version = CFG_SCHEMA;
-        s_cfg.disable_ap_on_usb_suspend = true;
         nvs_set_blob(nvs, CFG_KEY, &s_cfg, sizeof(s_cfg));
         nvs_commit(nvs);
     } else if (err != ESP_OK || s_cfg.schema_version != CFG_SCHEMA) {
