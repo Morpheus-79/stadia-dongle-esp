@@ -17,6 +17,16 @@ permissions:
   id-token: write
 
 jobs:
+  test-web:
+    name: WebHID transport tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Node tests
+        run: node --test "tests/**/*.test.mjs"
+
   build-firmware:
     name: Build ESP32-S3 firmware
     runs-on: ubuntu-latest

@@ -1,0 +1,9 @@
+{
+  "name": "stadia-dongle-esp-web",
+  "private": true,
+  "type": "module",
+  "description": "Node test harness for the WebHID configuration transport in docs/",
+  "scripts": {
+    "test": "node --test \"tests/**/*.test.mjs\""
+  }
+}

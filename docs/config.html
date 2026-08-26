@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Stadia BT Dongle — USB Configuration</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100vh;
+      background: #0f0f0f;
+      color: #e8e8e8;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      padding: 2rem 1rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 1rem;
+    }
+    .card {
+      background: #1a1a1a;
+      border: 1px solid #2a2a2a;
+      border-radius: 16px;
+      padding: 1.5rem;
+      max-width: 560px;
+      width: 100%;
+    }
+    h1 { font-size: 1.4rem; font-weight: 600; color: #fff; }
+    h2 { font-size: 1rem; font-weight: 600; color: #fff; margin-bottom: 0.8rem; }
+    .subtitle { font-size: 0.85rem; color: #888; margin-top: 0.3rem; }
+    button {
+      background: #fff; color: #000; font: inherit; font-weight: 600;
+      font-size: 0.85rem; padding: 0.5rem 1.1rem; border-radius: 8px;
+      border: none; cursor: pointer; transition: background 0.15s;
+    }
+    button:hover { background: #ddd; }
+    button:disabled { background: #333; color: #777; cursor: default; }
+    button.ghost {
+      background: transparent; color: #ccc; border: 1px solid #444;
+    }
+    button.ghost:hover { background: #242424; }
+    button.danger { background: transparent; color: #f88; border: 1px solid #663333; }
+    button.danger:hover { background: #2a1515; }
+    select, input[type=number] {
+      background: #0f0f0f; color: #e8e8e8; border: 1px solid #333;
+      border-radius: 8px; padding: 0.45rem 0.6rem; font: inherit; font-size: 0.85rem;
+      width: 100%;
+    }
+    label { font-size: 0.78rem; color: #999; display: block; margin-bottom: 0.25rem; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; }
+    .row { display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: center; }
+    .field { margin-bottom: 0.8rem; }
+    .check { display: flex; align-items: center; gap: 0.5rem; font-size: 0.85rem; color: #ccc; }
+    .check input { accent-color: #fff; }
+    .kv { display: grid; grid-template-columns: auto 1fr; gap: 0.25rem 1rem; font-size: 0.85rem; }
+    .kv .k { color: #888; }
+    .kv .v { color: #e8e8e8; word-break: break-word; }
+    .pill {
+      display: inline-block; padding: 0.15rem 0.6rem; border-radius: 999px;
+      font-size: 0.75rem; background: #242424; border: 1px solid #333; color: #bbb;
+      margin: 0 0.3rem 0.3rem 0;
+    }
+    .pill.on { background: #10331a; border-color: #1d5c30; color: #7fd794; }
+    #error {
+      display: none; max-width: 560px; width: 100%;
+      background: #2a1515; border: 1px solid #663333; border-radius: 8px;
+      padding: 0.7rem 1rem; color: #f4a5a5; font-size: 0.85rem;
+    }
+    .controller {
+      border: 1px solid #2a2a2a; border-radius: 10px; padding: 0.8rem;
+      margin-bottom: 0.7rem;
+    }
+    .controller .name { font-weight: 600; font-size: 0.9rem; }
+    .controller .addr { color: #888; font-size: 0.78rem; font-family: ui-monospace, monospace; }
+    .live {
+      font-family: ui-monospace, monospace; font-size: 0.8rem; color: #9fd;
+      background: #0a1410; border: 1px solid #1d3328; border-radius: 8px;
+      padding: 0.6rem; min-height: 3.2rem; white-space: pre-wrap;
+    }
+    .hint { font-size: 0.78rem; color: #666; margin-top: 0.6rem; line-height: 1.45; }
+    .hidden { display: none; }
+    a { color: #888; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🎮 USB Configuration</h1>
+    <p class="subtitle">Configure your Stadia BT Dongle over its USB cable — no Wi-Fi needed.</p>
+    <div class="row" style="margin-top:1rem">
+      <button id="connect">Connect dongle</button>
+      <span id="conn-state" class="pill">not connected</span>
+    </div>
+    <p class="hint" id="webhid-missing" style="display:none">
+      This browser has no WebHID support. Use <strong>Chrome</strong> or
+      <strong>Edge</strong> on desktop.
+    </p>
+    <p class="hint">
+      The dongle must be plugged into its <strong>native USB</strong> port and
+      running firmware v1.07 or newer
+      (<a href="index.html">web installer</a>). Everything here talks directly
+      to the device; nothing leaves your machine.
+    </p>
+  </div>
+
+  <div id="error"></div>
+
+  <div class="card hidden" id="card-status">
+    <h2>Status</h2>
+    <div class="kv" id="status-kv"></div>
+    <div style="margin-top:0.6rem" id="status-pills"></div>
+  </div>
+
+  <div class="card hidden" id="card-config">
+    <h2>Button actions</h2>
+    <div class="grid2">
+      <div class="field"><label>Assistant — short press</label><select id="assistant_short"></select></div>
+      <div class="field"><label>Assistant — long press</label><select id="assistant_long"></select></div>
+      <div class="field"><label>Capture — short press</label><select id="capture_short"></select></div>
+      <div class="field"><label>Capture — long press</label><select id="capture_long"></select></div>
+      <div class="field"><label>Long press threshold (ms)</label><input type="number" id="long_press_ms" min="300" max="5000" step="50"></div>
+      <div class="field"><label>Web UI auto-off (seconds)</label><input type="number" id="webui_timeout_seconds" min="15" max="1800" step="5"></div>
+    </div>
+    <div class="field check"><input type="checkbox" id="disable_ap_on_suspend"><label for="disable_ap_on_suspend" style="margin:0">Stop Wi-Fi AP while the PC sleeps</label></div>
+    <div class="field check"><input type="checkbox" id="webui_auto_start"><label for="webui_auto_start" style="margin:0">Auto-start Wi-Fi setup AP when no controller is bonded</label></div>
+    <div class="row">
+      <button id="save-config">Save</button>
+      <button class="ghost" id="reload-config">Reload</button>
+      <span id="config-msg" class="pill" style="display:none"></span>
+    </div>
+  </div>
+
+  <div class="card hidden" id="card-controllers">
+    <h2>Controllers</h2>
+    <div id="controllers"></div>
+    <div class="row">
+      <button id="pair">Start pairing</button>
+      <button class="ghost" id="stop-pair">Stop pairing</button>
+      <button class="danger" id="forget-all">Forget all</button>
+    </div>
+    <p class="hint">To pair: hold <strong>Stadia + Y</strong> on the controller until it flashes orange.</p>
+  </div>
+
+  <div class="card hidden" id="card-live">
+    <h2>Live input</h2>
+    <div class="field check"><input type="checkbox" id="live-enable"><label for="live-enable" style="margin:0">Poll controller input (10 Hz)</label></div>
+    <div class="live" id="live-out">—</div>
+  </div>
+
+  <div class="card hidden" id="card-system">
+    <h2>System</h2>
+    <div class="row">
+      <button class="ghost" id="start-wifi">Start Wi-Fi AP</button>
+      <button class="ghost" id="stop-wifi">Stop Wi-Fi AP</button>
+      <button class="danger" id="reboot">Reboot dongle</button>
+    </div>
+    <p class="hint">The Wi-Fi AP hosts the full Web UI at <strong>http://192.168.4.1</strong> (firmware updates live there).</p>
+  </div>
+
+  <script type="module">
+    import {
+      ACTIONS, CMD, DONGLE_STATES, decodeConfig, decodeController,
+      decodeDeviceInfo, decodeInput, decodeStatus, encodeConfig, requestDongle,
+    } from "./webhid-transport.js";
+
+    const $ = (id) => document.getElementById(id);
+    let transport = null;
+    let statusTimer = null;
+    let liveTimer = null;
+
+    const showError = (message) => {
+      const el = $("error");
+      el.textContent = message;
+      el.style.display = message ? "block" : "none";
+    };
+    const guard = (fn) => async () => {
+      try { showError(""); await fn(); }
+      catch (error) { showError(error.message); }
+    };
+
+    for (const select of ["assistant_short", "assistant_long", "capture_short", "capture_long"].map($)) {
+      for (const action of ACTIONS) {
+        const option = document.createElement("option");
+        option.value = action.value;
+        option.textContent = action.label;
+        select.appendChild(option);
+      }
+    }
+
+    if (!navigator.hid) {
+      $("webhid-missing").style.display = "block";
+      $("connect").disabled = true;
+    }
+
+    async function refreshStatus() {
+      const status = decodeStatus(await transport.command(CMD.GET_STATUS));
+      const kv = [
+        ["State", DONGLE_STATES[status.state] ?? status.state],
+        ["Uptime", `${Math.floor(status.uptime_ms / 60000)} min`],
+        ["Controllers", `${status.connected_count} connected, ${status.stored_bonds} bonded`],
+        ["Battery", status.battery_percent === null ? "—" : `${status.battery_percent}%`],
+      ];
+      if (status.controller_name) {
+        kv.push(["Controller", `${status.controller_name} (${status.controller_address})`]);
+      }
+      if (status.webui_active) {
+        kv.push(["Web UI auto-off", `${status.webui_auto_off_seconds} s`]);
+      }
+      $("status-kv").innerHTML = kv
+        .map(([k, v]) => `<span class="k">${k}</span><span class="v">${v}</span>`)
+        .join("");
+      const pills = [
+        ["Wi-Fi AP", status.webui_active],
+        ["BLE ready", status.ble_ready],
+        ["Pairing", status.pairing],
+        ["USB suspended", status.usb_suspended],
+        ["Remote wake", status.remote_wake_enabled],
+      ];
+      $("status-pills").innerHTML = pills
+        .map(([label, on]) => `<span class="pill${on ? " on" : ""}">${label}</span>`)
+        .join("");
+    }
+
+    async function refreshControllers() {
+      const countPayload = await transport.command(CMD.GET_CONTROLLER_COUNT);
+      const count = countPayload[0];
+      const items = [];
+      for (let i = 0; i < count; i++) {
+        items.push(decodeController(
+          await transport.command(CMD.GET_CONTROLLER, new Uint8Array([i]))));
+      }
+      $("controllers").innerHTML = items.length
+        ? items.map((c) => `
+            <div class="controller">
+              <div class="row" style="justify-content:space-between">
+                <div>
+                  <div class="name">${c.name || "Stadia Controller"}</div>
+                  <div class="addr">${c.address}</div>
+                </div>
+                <button class="danger" data-forget="${c.address}">Forget</button>
+              </div>
+              <div style="margin-top:0.4rem">
+                ${c.connected ? '<span class="pill on">connected</span>' : '<span class="pill">stored bond</span>'}
+                ${c.ready ? '<span class="pill on">ready</span>' : ""}
+                ${c.mouse_mode ? '<span class="pill on">mouse mode</span>' : ""}
+                ${c.battery_percent !== null ? `<span class="pill">${c.battery_percent}%</span>` : ""}
+              </div>
+            </div>`).join("")
+        : '<p class="hint">No controllers paired yet.</p>';
+      for (const button of $("controllers").querySelectorAll("[data-forget]")) {
+        button.addEventListener("click", guard(async () => {
+          const address = button.dataset.forget;
+          await transport.command(CMD.FORGET_CONTROLLER,
+            new TextEncoder().encode(address.padEnd(17, "\0").slice(0, 17)));
+          await refreshControllers();
+        }));
+      }
+    }
+
+    async function loadConfig() {
+      const cfg = decodeConfig(await transport.command(CMD.GET_CONFIG));
+      $("assistant_short").value = cfg.assistant_short;
+      $("assistant_long").value = cfg.assistant_long;
+      $("capture_short").value = cfg.capture_short;
+      $("capture_long").value = cfg.capture_long;
+      $("long_press_ms").value = cfg.long_press_ms;
+      $("webui_timeout_seconds").value = cfg.webui_timeout_seconds;
+      $("disable_ap_on_suspend").checked = cfg.disable_ap_on_suspend;
+      $("webui_auto_start").checked = cfg.webui_auto_start;
+    }
+
+    $("connect").addEventListener("click", guard(async () => {
+      transport = await requestDongle(navigator.hid);
+      if (!transport) return;
+      await transport.command(CMD.PING);
+      const info = decodeDeviceInfo(await transport.command(CMD.GET_DEVICE_INFO));
+      $("conn-state").textContent = `connected — ${info.firmware_version}`;
+      $("conn-state").classList.add("on");
+      for (const id of ["card-status", "card-config", "card-controllers", "card-live", "card-system"]) {
+        $(id).classList.remove("hidden");
+      }
+      await loadConfig();
+      await refreshControllers();
+      await refreshStatus();
+      clearInterval(statusTimer);
+      statusTimer = setInterval(guard(refreshStatus), 2000);
+    }));
+
+    $("save-config").addEventListener("click", guard(async () => {
+      const cfg = {
+        assistant_short: Number($("assistant_short").value),
+        assistant_long: Number($("assistant_long").value),
+        capture_short: Number($("capture_short").value),
+        capture_long: Number($("capture_long").value),
+        long_press_ms: Number($("long_press_ms").value),
+        webui_timeout_seconds: Number($("webui_timeout_seconds").value),
+        disable_ap_on_suspend: $("disable_ap_on_suspend").checked,
+        webui_auto_start: $("webui_auto_start").checked,
+      };
+      await transport.command(CMD.SET_CONFIG, encodeConfig(cfg));
+      const msg = $("config-msg");
+      msg.textContent = "saved";
+      msg.style.display = "inline-block";
+      setTimeout(() => { msg.style.display = "none"; }, 2000);
+    }));
+    $("reload-config").addEventListener("click", guard(loadConfig));
+
+    $("pair").addEventListener("click", guard(async () => {
+      await transport.command(CMD.START_PAIRING);
+      await refreshStatus();
+    }));
+    $("stop-pair").addEventListener("click", guard(async () => {
+      await transport.command(CMD.STOP_PAIRING);
+      await refreshStatus();
+    }));
+    $("forget-all").addEventListener("click", guard(async () => {
+      if (!confirm("Forget all paired controllers?")) return;
+      await transport.command(CMD.FORGET_ALL);
+      await refreshControllers();
+    }));
+
+    $("start-wifi").addEventListener("click", guard(() => transport.command(CMD.START_WIFI)));
+    $("stop-wifi").addEventListener("click", guard(() => transport.command(CMD.STOP_WIFI)));
+    $("reboot").addEventListener("click", guard(async () => {
+      if (!confirm("Reboot the dongle? Controllers will briefly disconnect.")) return;
+      await transport.command(CMD.REBOOT);
+    }));
+
+    $("live-enable").addEventListener("change", () => {
+      clearInterval(liveTimer);
+      if (!$("live-enable").checked) { $("live-out").textContent = "—"; return; }
+      liveTimer = setInterval(guard(async () => {
+        const input = decodeInput(
+          await transport.command(CMD.GET_INPUT, new Uint8Array([255])));
+        $("live-out").textContent =
+          `pressed: ${input.pressed.join(" ") || "(none)"}\n` +
+          `LX ${input.lx}  LY ${input.ly}  RX ${input.rx}  RY ${input.ry}  ` +
+          `LT ${input.lt}  RT ${input.rt}\n` +
+          `raw: ${input.raw.map((b) => b.toString(16).padStart(2, "0")).join(" ")}`;
+      }), 100);
+    });
+  </script>
+</body>
+</html>
