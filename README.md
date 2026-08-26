@@ -170,7 +170,9 @@ Access at `http://192.168.4.1` when the AP is active. Provides:
 
 The AP starts on fresh flash, when no bonds exist, or by holding
 **Assistant** button. It auto-disables after a configurable
-timeout (default 120 s) when a controller is connected.
+timeout (default 120 s) when a controller is connected. Once a controller is
+bonded, the AP stays off at boot so the 2.4 GHz radio is free for controller
+traffic; hold **Assistant** whenever you need the Web UI.
 
 ## USB Remote Wake
 

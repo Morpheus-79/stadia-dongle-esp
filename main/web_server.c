@@ -652,7 +652,10 @@ static void web_monitor_task(void *arg)
         config_store_get(&cfg);
         if (s_ap_stopped_for_suspend && !s_usb_suspended) {
             ESP_LOGI("WEB", "Restarting Web UI/AP after USB resume");
-            web_server_request_start(false);
+            /* Explicit: this restores an AP that was already running before
+             * the host slept, so the bonded-controller auto-start gate must
+             * not block it. */
+            web_server_request_start(true);
             s_ap_stopped_for_suspend = false;
         } else if (cfg.disable_ap_on_usb_suspend) {
             if (s_usb_suspended && s_httpd && !s_ap_stopped_for_suspend && s_sta_count == 0) {
@@ -680,7 +683,24 @@ void web_server_init(void)
 
 void web_server_start(bool explicit_request)
 {
-    (void)explicit_request;
+    /*
+     * Wi-Fi is opt-in once a controller is bonded: the AP shares the single
+     * 2.4 GHz radio with the controller links, so it only auto-starts on a
+     * dongle that still needs first-time setup. An explicit request -- the
+     * Assistant long-press, the Web UI, or the USB configuration channel --
+     * always starts it.
+     *
+     * Ported from jazz-zzzz/stadia-dongle-esp (commit 4fdc44c).
+     */
+    if (!explicit_request) {
+        dongle_config_t config;
+        config_store_get(&config);
+        if (!config.webui_auto_start_if_no_bond ||
+            controller_manager_bond_count() != 0) {
+            return;
+        }
+    }
+
     if (s_httpd) {
         update_webui_deadline();
         return;
