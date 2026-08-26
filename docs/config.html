@@ -156,12 +156,32 @@
     <p class="hint">The Wi-Fi AP hosts the full Web UI at <strong>http://192.168.4.1</strong> (firmware updates live there).</p>
   </div>
 
+  <script>
+    // The module below cannot load from a file:// URL (unique-origin CORS) and
+    // WebHID needs a secure context. Explain instead of failing silently.
+    window.addEventListener("DOMContentLoaded", () => {
+      setTimeout(() => {
+        if (window.__configPageReady) return;
+        const el = document.getElementById("error");
+        el.style.display = "block";
+        el.innerHTML = location.protocol === "file:"
+          ? "This page cannot run from a <code>file://</code> URL. Run " +
+            "<code>serve.cmd</code> in the docs folder (or " +
+            "<code>python -m http.server</code>) and open " +
+            "<code>http://localhost:8000/config.html</code> — or use the " +
+            "hosted copy on GitHub Pages."
+          : "The page script failed to load. Use desktop Chrome or Edge over " +
+            "http(s), and check the browser console for details.";
+      }, 500);
+    });
+  </script>
   <script type="module">
     import {
       ACTIONS, CMD, DONGLE_STATES, decodeConfig, decodeController,
       decodeDeviceInfo, decodeInput, decodeStatus, encodeConfig, requestDongle,
     } from "./webhid-transport.js";
 
+    window.__configPageReady = true;
     const $ = (id) => document.getElementById(id);
     let transport = null;
     let statusTimer = null;
